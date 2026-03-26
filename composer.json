@@ -3,6 +3,13 @@
     "description": "PSR-7 stream decorators for WhatsApp media encryption and decryption",
     "type": "library",
     "license": "MIT",
+    "authors": [
+        {
+            "name": "Vladislav Mischenko",
+            "email": "vamischenko@gmail.com",
+            "homepage": "https://github.com/vamischenko"
+        }
+    ],
     "require": {
         "php": "^8.1",
         "ext-openssl": "*",
