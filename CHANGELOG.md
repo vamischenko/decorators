@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.2] — 2026-03-26
+
+- add CI unit tests
+
+## [1.1.1] — 2026-03-26
+
+- some fixes
+
 ## [1.1.0] — 2026-03-26
 
 ### Documentation
