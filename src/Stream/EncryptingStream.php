@@ -26,8 +26,12 @@ use Vamischenko\Decorators\Sidecar\SidecarContext;
  *   → AppendStream([iv, ciphertext])  — iv prepended so HMAC-SHA256 covers it
  *   → HashingStream         (HMAC-SHA256, macKey)
  *
- * The iv bytes are drained internally after HMAC computation but before
- * emitting bytes to callers. Callers only receive ciphertext + 10-byte MAC.
+ * The iv bytes pass through HashingStream (counted in MAC) but are skipped in
+ * read() output — callers receive only ciphertext + 10-byte MAC.
+ *
+ * Data is streamed incrementally: no more than one internal read-buffer is held
+ * in memory at a time. The 10-byte MAC is buffered only after the last block.
+ *
  * The stream is forward-only (not seekable).
  */
 final class EncryptingStream implements StreamInterface
@@ -43,12 +47,20 @@ final class EncryptingStream implements StreamInterface
     private bool $macEmitted       = false;
     private bool $sidecarFinalized = false;
 
-    /** Output buffer: ciphertext bytes ready to be returned to callers */
-    private string $outputBuffer = '';
+    /**
+     * Small carry-buffer for leftovers between read() calls.
+     * At most (MAC_LENGTH - 1) bytes at any time.
+     */
+    private string $carryBuffer = '';
 
-    /** Number of iv bytes still to drain from the HashingStream output */
+    /** Number of iv bytes still to drain from the start of the HashingStream output */
     private int $ivBytesToSkip;
 
+    /**
+     * @param StreamInterface     $source  Plaintext source stream.
+     * @param ExpandedKey         $key     Expanded key material (iv, cipherKey, macKey).
+     * @param SidecarContext|null $sidecar Optional sidecar accumulator for VIDEO/AUDIO seek support.
+     */
     public function __construct(
         StreamInterface $source,
         private readonly ExpandedKey $key,
@@ -65,7 +77,7 @@ final class EncryptingStream implements StreamInterface
             $aesStream,
         ]);
 
-        // HMAC-SHA256 over the combined stream; captures hash on EOF
+        // HMAC-SHA256 over the combined stream; captures the hash when EOF is reached
         $this->stream = new HashingStream(
             $combined,
             $key->macKey,
@@ -78,6 +90,7 @@ final class EncryptingStream implements StreamInterface
         $this->sidecar?->feed($key->iv);
     }
 
+    /** This stream is forward-only; seeking is not supported. */
     public function isSeekable(): bool
     {
         return false;
@@ -85,7 +98,7 @@ final class EncryptingStream implements StreamInterface
 
     /**
      * Output size = ciphertext + 10-byte MAC.
-     * HashingStream size = iv + ciphertext, so subtract iv length.
+     * HashingStream wraps iv + ciphertext, so subtract the iv length.
      */
     public function getSize(): ?int
     {
@@ -97,22 +110,37 @@ final class EncryptingStream implements StreamInterface
         return $combinedSize - \strlen($this->key->iv) + self::MAC_LENGTH;
     }
 
+    /**
+     * Reads up to $length bytes of encrypted output (ciphertext, then 10-byte MAC).
+     *
+     * @param int $length Maximum number of bytes to return.
+     * @return string Encrypted bytes; empty string when the stream is exhausted.
+     */
     public function read(int $length): string
     {
-        // Lazily populate the output buffer on first read by draining the full
-        // pipeline. AesEncryptingStream reports eof() as soon as the plaintext
-        // source is exhausted, even though its internal block buffer may still
-        // hold bytes — so we must drain it in one shot rather than looping on eof().
-        if (!$this->macEmitted && $this->outputBuffer === '') {
-            $combined = Utils::copyToString($this->stream);
+        $out = $this->carryBuffer;
+        $this->carryBuffer = '';
 
-            // Strip the iv prefix (hashed but not emitted)
-            $ciphertext = \substr($combined, \strlen($this->key->iv));
+        // Read ciphertext from the pipeline until we have enough or source is done
+        while (\strlen($out) < $length && !$this->stream->eof()) {
+            $data = $this->stream->read($length - \strlen($out) + $this->ivBytesToSkip);
 
-            $this->outputBuffer = $ciphertext . $this->mac;
+            // Discard iv bytes that appear at the front of the HashingStream output
+            if ($this->ivBytesToSkip > 0) {
+                $skip = \min($this->ivBytesToSkip, \strlen($data));
+                $data = \substr($data, $skip);
+                $this->ivBytesToSkip -= $skip;
+            }
+
+            $out .= $data;
+            $this->sidecar?->feed($data);
+        }
+
+        // After ciphertext is exhausted, append the 10-byte truncated MAC
+        if ($this->stream->eof() && !$this->macEmitted) {
+            $out .= $this->mac;
             $this->macEmitted = true;
 
-            $this->sidecar?->feed($ciphertext);
             $this->sidecar?->feed($this->mac);
 
             if (!$this->sidecarFinalized) {
@@ -121,14 +149,19 @@ final class EncryptingStream implements StreamInterface
             }
         }
 
-        $out = \substr($this->outputBuffer, 0, $length);
-        $this->outputBuffer = \substr($this->outputBuffer, $length);
+        // If we produced more bytes than requested (e.g. iv skip returned extras),
+        // save the overflow for the next read() call
+        if (\strlen($out) > $length) {
+            $this->carryBuffer = \substr($out, $length);
+            $out = \substr($out, 0, $length);
+        }
 
         return $out;
     }
 
+    /** Returns true only after the ciphertext, the 10-byte MAC, and any carry buffer have all been consumed. */
     public function eof(): bool
     {
-        return $this->stream->eof() && $this->macEmitted && $this->outputBuffer === '';
+        return $this->stream->eof() && $this->macEmitted && $this->carryBuffer === '';
     }
 }

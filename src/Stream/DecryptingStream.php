@@ -16,9 +16,15 @@ use Vamischenko\Decorators\Exception\MacVerificationException;
  * (The iv is not part of the stream — it comes from the expanded key.)
  *
  * MAC is verified before any decrypted bytes are returned (integrity-first).
- * For seekable streams with a known size the MAC is read from the tail without
- * buffering the entire ciphertext. For non-seekable streams the full content is
- * buffered (unavoidable when MAC is at the end).
+ * Uses constant-time hash_equals() comparison to prevent timing attacks.
+ *
+ * Memory behaviour:
+ *   - Seekable streams (e.g. file handles): MAC is read from the tail via seek,
+ *     ciphertext is read once for HMAC verification, then decrypted. The plaintext
+ *     is buffered in full after decryption (AES-CBC requires the whole block).
+ *   - Non-seekable streams (e.g. HTTP response bodies): the entire encrypted
+ *     content is buffered in memory before verification and decryption.
+ *     For large files on constrained environments use a seekable stream instead.
  */
 final class DecryptingStream implements StreamInterface
 {
@@ -33,6 +39,10 @@ final class DecryptingStream implements StreamInterface
     private string $outputBuffer = '';
     private bool $done          = false;
 
+    /**
+     * @param StreamInterface $stream Encrypted source stream (format: ciphertext + 10-byte MAC).
+     * @param ExpandedKey     $key    Expanded key material used for MAC verification and decryption.
+     */
     public function __construct(
         StreamInterface $stream,
         private readonly ExpandedKey $key,
@@ -40,6 +50,7 @@ final class DecryptingStream implements StreamInterface
         $this->stream = $stream;
     }
 
+    /** This stream is forward-only; seeking is not supported. */
     public function isSeekable(): bool
     {
         return false;
@@ -53,6 +64,15 @@ final class DecryptingStream implements StreamInterface
         return null;
     }
 
+    /**
+     * Reads up to $length plaintext bytes.
+     * Triggers MAC verification and decryption on the first call.
+     *
+     * @param int $length Maximum number of bytes to return.
+     * @return string Decrypted plaintext bytes.
+     * @throws MacVerificationException if the MAC does not match.
+     * @throws \RuntimeException if OpenSSL decryption fails.
+     */
     public function read(int $length): string
     {
         if (!$this->initialized) {
@@ -65,6 +85,7 @@ final class DecryptingStream implements StreamInterface
         return $out;
     }
 
+    /** Returns true once decryption is complete and the plaintext buffer has been fully consumed. */
     public function eof(): bool
     {
         return $this->initialized && $this->done && $this->outputBuffer === '';

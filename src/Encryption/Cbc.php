@@ -15,6 +15,11 @@ final class Cbc implements CipherMethod
     private string $baseIv;
     private string $iv;
 
+    /**
+     * @param string $iv      Initialization vector; length must match the OpenSSL requirement for the chosen key size.
+     * @param int    $keySize AES key size in bits (128, 192, or 256).
+     * @throws \InvalidArgumentException if the IV length does not match the cipher's requirement.
+     */
     public function __construct(string $iv, private readonly int $keySize = 256)
     {
         if (strlen($iv) !== openssl_cipher_iv_length("aes-{$keySize}-cbc")) {
@@ -24,21 +29,29 @@ final class Cbc implements CipherMethod
         $this->baseIv = $this->iv = $iv;
     }
 
+    /** Returns the OpenSSL cipher name, e.g. "aes-256-cbc". */
     public function getOpenSslName(): string
     {
         return "aes-{$this->keySize}-cbc";
     }
 
+    /** Returns the current IV, updated after each encrypted block. */
     public function getCurrentIv(): string
     {
         return $this->iv;
     }
 
+    /** CBC mode always requires PKCS7 padding on the final block. */
     public function requiresPadding(): bool
     {
         return true;
     }
 
+    /**
+     * Resets the IV to the initial value (rewind only; arbitrary seeking is not supported).
+     *
+     * @throws \LogicException if offset is non-zero or whence is not SEEK_SET.
+     */
     public function seek(int $offset, int $whence = SEEK_SET): void
     {
         if ($offset === 0 && $whence === SEEK_SET) {

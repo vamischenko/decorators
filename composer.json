@@ -3,6 +3,8 @@
     "description": "PSR-7 stream decorators for WhatsApp media encryption and decryption",
     "type": "library",
     "license": "MIT",
+    "homepage": "https://github.com/vamischenko/decorators",
+    "keywords": ["whatsapp", "encryption", "aes-256-cbc", "hmac", "psr-7", "streams", "media"],
     "authors": [
         {
             "name": "Vladislav Mischenko",

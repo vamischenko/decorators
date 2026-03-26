@@ -23,6 +23,11 @@ final class AesEncryptingStream implements StreamInterface
     private string $buffer = '';
     private CipherMethod $cipherMethod;
 
+    /**
+     * @param StreamInterface $plainText    Source stream containing data to encrypt.
+     * @param string          $key          Raw binary cipher key (length must match the chosen cipher).
+     * @param CipherMethod    $cipherMethod Cipher configuration; cloned so the caller's instance is unaffected.
+     */
     public function __construct(
         StreamInterface $plainText,
         private readonly string $key,
@@ -32,6 +37,11 @@ final class AesEncryptingStream implements StreamInterface
         $this->cipherMethod = clone $cipherMethod;
     }
 
+    /**
+     * Returns the encrypted output size, accounting for PKCS7 padding when the cipher requires it.
+     *
+     * @return int|null null if the plaintext size is unknown.
+     */
     public function getSize(): ?int
     {
         $plainTextSize = $this->stream->getSize();
@@ -44,11 +54,29 @@ final class AesEncryptingStream implements StreamInterface
         return $plainTextSize;
     }
 
+    /** This stream is read-only; writes are not supported. */
     public function isWritable(): bool
     {
         return false;
     }
 
+    /**
+     * Returns true only when the plaintext source is exhausted AND the internal
+     * ciphertext buffer has been fully consumed. StreamDecoratorTrait delegates
+     * eof() to the underlying stream, which reports true as soon as plaintext is
+     * read — even if encrypted bytes are still buffered.
+     */
+    public function eof(): bool
+    {
+        return $this->stream->eof() && $this->buffer === '';
+    }
+
+    /**
+     * Reads up to $length encrypted bytes, filling the internal buffer by encrypting plaintext blocks as needed.
+     *
+     * @param int $length Maximum number of bytes to return.
+     * @return string Raw encrypted bytes (may be shorter than $length near EOF).
+     */
     public function read(int $length): string
     {
         if ($length > strlen($this->buffer)) {
@@ -63,6 +91,13 @@ final class AesEncryptingStream implements StreamInterface
         return $data !== false ? $data : '';
     }
 
+    /**
+     * Seeks to the given offset within the encrypted stream.
+     *
+     * @param int $offset Byte offset to seek to.
+     * @param int $whence SEEK_SET or SEEK_CUR; SEEK_END is not supported.
+     * @throws \LogicException if an unsupported whence value is provided.
+     */
     public function seek($offset, $whence = SEEK_SET): void
     {
         if ($whence === SEEK_CUR) {

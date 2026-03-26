@@ -38,6 +38,9 @@ final class SidecarContext
     /** Rolling buffer of last OVERLAP bytes of all data fed so far */
     private string $tailBuffer = '';
 
+    /**
+     * @param string $macKey 32-byte HMAC-SHA256 key used to sign each chunk.
+     */
     public function __construct(private readonly string $macKey)
     {
     }
@@ -97,6 +100,10 @@ final class SidecarContext
         }
     }
 
+    /**
+     * Returns the accumulated sidecar bytes (concatenated 10-byte chunk MACs).
+     * Call only after finalize() has been invoked.
+     */
     public function getSidecar(): string
     {
         return $this->sidecar;

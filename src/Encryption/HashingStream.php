@@ -24,6 +24,12 @@ final class HashingStream implements StreamInterface
     /** @var callable|null */
     private $onComplete;
 
+    /**
+     * @param StreamInterface $stream     The underlying stream to read from and hash.
+     * @param string|null     $key        HMAC key; if null, a plain hash (no HMAC) is computed.
+     * @param callable|null   $onComplete Invoked with the raw binary hash once the stream reaches EOF.
+     * @param string          $algorithm  Hash algorithm name accepted by hash_init() (default: 'sha256').
+     */
     public function __construct(
         StreamInterface $stream,
         private readonly ?string $key = null,
@@ -41,6 +47,13 @@ final class HashingStream implements StreamInterface
         return $this->hash;
     }
 
+    /**
+     * Reads up to $length bytes, updating the running hash with each chunk.
+     * Finalizes the hash and invokes the onComplete callback when EOF is reached.
+     *
+     * @param int $length Maximum number of bytes to return.
+     * @return string The bytes read from the underlying stream.
+     */
     public function read(int $length): string
     {
         $data = $this->stream->read($length);
@@ -51,6 +64,8 @@ final class HashingStream implements StreamInterface
 
         if ($this->stream->eof()) {
             $this->hash = hash_final($this->hashContext, true);
+            // Explicitly unset to prevent accidental reuse of an invalidated context
+            unset($this->hashContext);
             if ($this->onComplete !== null) {
                 ($this->onComplete)($this->hash);
             }
@@ -59,6 +74,11 @@ final class HashingStream implements StreamInterface
         return $data;
     }
 
+    /**
+     * Rewinds the stream and resets the hash state (rewind only; arbitrary seeking is not supported).
+     *
+     * @throws \LogicException if offset is non-zero or whence is not SEEK_SET.
+     */
     public function seek($offset, $whence = SEEK_SET): void
     {
         if ($offset === 0 && $whence === SEEK_SET) {
