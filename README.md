@@ -103,12 +103,12 @@ $plaintext = (string) $stream;
 
 ## Memory behaviour
 
-| Stream type         | Encryption                    | Decryption                                                                                      |
-|---------------------|-------------------------------|-------------------------------------------------------------------------------------------------|
-| Seekable (file)     | Incremental — O(block) memory | Full plaintext buffered after decryption                                                        |
-| Non-seekable (HTTP) | Incremental — O(block) memory | **Full ciphertext buffered** (MAC is at the tail, verification is mandatory before decryption)  |
+| Stream type         | Encryption                    | Decryption                                                                                                 |
+|---------------------|-------------------------------|------------------------------------------------------------------------------------------------------------|
+| Seekable (file)     | Incremental — O(block) memory | Incremental — O(block) memory (MAC read via seek, then streaming `AesDecryptingStream`)                    |
+| Non-seekable (HTTP) | Incremental — O(block) memory | **Full ciphertext buffered** (MAC is at the tail), then plaintext delivered incrementally — no second copy |
 
-For large non-seekable streams wrap the response body in a temporary file before decrypting.
+For memory-constrained environments with non-seekable sources, wrap the response body in a temp-file stream before passing it to `DecryptingStream`.
 
 ## Sidecar
 

@@ -4,8 +4,13 @@ declare(strict_types=1);
 
 namespace Vamischenko\Decorators\Stream;
 
+use GuzzleHttp\Psr7\AppendStream;
+use GuzzleHttp\Psr7\LimitStream;
 use GuzzleHttp\Psr7\StreamDecoratorTrait;
+use GuzzleHttp\Psr7\Utils;
 use Psr\Http\Message\StreamInterface;
+use Vamischenko\Decorators\Encryption\AesDecryptingStream;
+use Vamischenko\Decorators\Encryption\HashingStream;
 use Vamischenko\Decorators\ExpandedKey;
 use Vamischenko\Decorators\Exception\MacVerificationException;
 
@@ -13,18 +18,23 @@ use Vamischenko\Decorators\Exception\MacVerificationException;
  * PSR-7 stream decorator that decrypts a WhatsApp-encrypted stream.
  *
  * Input format: [ciphertext] [hmac-sha256 truncated to 10 bytes]
- * (The iv is not part of the stream — it comes from the expanded key.)
+ * (The IV is not part of the stream — it comes from the expanded key.)
  *
- * MAC is verified before any decrypted bytes are returned (integrity-first).
+ * MAC is verified before any plaintext bytes are returned (integrity-first).
  * Uses constant-time hash_equals() comparison to prevent timing attacks.
  *
- * Memory behaviour:
+ * Streaming behaviour:
  *   - Seekable streams (e.g. file handles): MAC is read from the tail via seek,
- *     ciphertext is read once for HMAC verification, then decrypted. The plaintext
- *     is buffered in full after decryption (AES-CBC requires the whole block).
- *   - Non-seekable streams (e.g. HTTP response bodies): the entire encrypted
- *     content is buffered in memory before verification and decryption.
- *     For large files on constrained environments use a seekable stream instead.
+ *     then the ciphertext is decrypted incrementally through AesDecryptingStream.
+ *     Memory usage is O(block size), not O(file size).
+ *   - Non-seekable streams (e.g. HTTP response bodies): the entire ciphertext
+ *     must be buffered first (MAC sits at the tail — verification requires it).
+ *     After MAC verification the buffered ciphertext is wrapped in a stream and
+ *     decrypted incrementally; no second full copy is made.
+ *     For memory-constrained environments, wrap the source in a temp-file stream
+ *     before passing it to DecryptingStream.
+ *
+ * The stream is forward-only (seeking is not supported).
  */
 final class DecryptingStream implements StreamInterface
 {
@@ -35,19 +45,18 @@ final class DecryptingStream implements StreamInterface
     /** @var StreamInterface */
     private StreamInterface $stream;
 
-    private bool $initialized  = false;
-    private string $outputBuffer = '';
-    private bool $done          = false;
+    private bool $initialized = false;
 
     /**
-     * @param StreamInterface $stream Encrypted source stream (format: ciphertext + 10-byte MAC).
+     * @param StreamInterface $source Encrypted source stream (format: ciphertext + 10-byte MAC).
      * @param ExpandedKey     $key    Expanded key material used for MAC verification and decryption.
      */
     public function __construct(
-        StreamInterface $stream,
+        StreamInterface $source,
         private readonly ExpandedKey $key,
     ) {
-        $this->stream = $stream;
+        // Placeholder until initialize() builds the real decryption stream.
+        $this->stream = $source;
     }
 
     /** This stream is forward-only; seeking is not supported. */
@@ -66,7 +75,7 @@ final class DecryptingStream implements StreamInterface
 
     /**
      * Reads up to $length plaintext bytes.
-     * Triggers MAC verification and decryption on the first call.
+     * Triggers MAC verification and sets up the decryption pipeline on the first call.
      *
      * @param int $length Maximum number of bytes to return.
      * @return string Decrypted plaintext bytes.
@@ -79,16 +88,13 @@ final class DecryptingStream implements StreamInterface
             $this->initialize();
         }
 
-        $out = substr($this->outputBuffer, 0, $length);
-        $this->outputBuffer = substr($this->outputBuffer, $length);
-
-        return $out;
+        return $this->stream->read($length);
     }
 
-    /** Returns true once decryption is complete and the plaintext buffer has been fully consumed. */
+    /** Returns true once the decryption stream is exhausted. */
     public function eof(): bool
     {
-        return $this->initialized && $this->done && $this->outputBuffer === '';
+        return $this->initialized && $this->stream->eof();
     }
 
     private function initialize(): void
@@ -100,40 +106,56 @@ final class DecryptingStream implements StreamInterface
         }
 
         $this->initialized = true;
-        $this->done = true;
     }
 
     /**
-     * Optimized path for seekable streams: seeks to the tail to read the MAC,
-     * then rewinds and reads the ciphertext for verification, avoiding a second
-     * full read for decryption.
+     * Seekable path: reads the MAC from the tail via seek, verifies it by
+     * streaming iv + ciphertext through HMAC-SHA256, then rewinds and builds
+     * an AesDecryptingStream over the ciphertext — true streaming decryption.
      */
     private function initializeFromSeekable(): void
     {
-        $size = $this->stream->getSize();
+        $size           = $this->stream->getSize();
         $ciphertextSize = $size - self::MAC_LENGTH;
 
         // Read MAC from the tail
         $this->stream->seek($ciphertextSize);
-        $mac = $this->stream->read(self::MAC_LENGTH);
+        $mac = $this->readExact($this->stream, self::MAC_LENGTH);
+
+        // Verify MAC by streaming iv + ciphertext through HMAC (no extra copy)
         $this->stream->rewind();
+        $ciphertextStream = new LimitStream($this->stream, $ciphertextSize);
 
-        // Read ciphertext for HMAC verification
-        $ciphertext = $this->stream->read($ciphertextSize);
-
-        $this->verifyMac($ciphertext, $mac);
-
-        $plaintext = openssl_decrypt($ciphertext, 'aes-256-cbc', $this->key->cipherKey, OPENSSL_RAW_DATA, $this->key->iv);
-        if ($plaintext === false) {
-            throw new \RuntimeException('OpenSSL decryption failed: ' . openssl_error_string());
+        // Build iv + ciphertext stream for HMAC
+        $ivStream   = Utils::streamFor($this->key->iv);
+        $hmacInput  = new AppendStream([$ivStream, $ciphertextStream]);
+        $computedMac = '';
+        $hashing = new HashingStream(
+            $hmacInput,
+            $this->key->macKey,
+            function (string $hash) use (&$computedMac): void {
+                $computedMac = \substr($hash, 0, self::MAC_LENGTH);
+            },
+        );
+        while (!$hashing->eof()) {
+            $hashing->read(8192);
         }
 
-        $this->outputBuffer = $plaintext;
+        if (!hash_equals($computedMac, $mac)) {
+            throw new MacVerificationException('MAC verification failed: encrypted media is corrupt or tampered');
+        }
+
+        // Rewind and build incremental decryption stream over the ciphertext
+        $this->stream->rewind();
+        $ciphertextOnly = new LimitStream($this->stream, $ciphertextSize);
+
+        $this->stream = new AesDecryptingStream($ciphertextOnly, $this->key->cipherKey, $this->key->iv);
     }
 
     /**
-     * Fallback path for non-seekable streams: buffers the entire encrypted content,
-     * then verifies the MAC and decrypts.
+     * Non-seekable path: buffers the entire ciphertext (MAC is at the tail),
+     * verifies the MAC, then wraps the buffer in AesDecryptingStream for
+     * incremental plaintext delivery — no second full copy is made.
      */
     private function initializeFromBuffer(): void
     {
@@ -142,29 +164,36 @@ final class DecryptingStream implements StreamInterface
             $encrypted .= $this->stream->read(8192);
         }
 
-        $mac        = substr($encrypted, -self::MAC_LENGTH);
-        $ciphertext = substr($encrypted, 0, -self::MAC_LENGTH);
+        $mac        = \substr($encrypted, -self::MAC_LENGTH);
+        $ciphertext = \substr($encrypted, 0, -self::MAC_LENGTH);
+        unset($encrypted); // release the combined buffer
 
-        $this->verifyMac($ciphertext, $mac);
+        $expected = \substr(
+            hash_hmac('sha256', $this->key->iv . $ciphertext, $this->key->macKey, true),
+            0,
+            self::MAC_LENGTH,
+        );
 
-        $plaintext = openssl_decrypt($ciphertext, 'aes-256-cbc', $this->key->cipherKey, OPENSSL_RAW_DATA, $this->key->iv);
-        if ($plaintext === false) {
-            throw new \RuntimeException('OpenSSL decryption failed: ' . openssl_error_string());
-        }
-
-        $this->outputBuffer = $plaintext;
-    }
-
-    /**
-     * @throws MacVerificationException when the HMAC does not match (tampered or corrupt data)
-     */
-    private function verifyMac(string $ciphertext, string $mac): void
-    {
-        $expected = substr(hash_hmac('sha256', $this->key->iv . $ciphertext, $this->key->macKey, true), 0, self::MAC_LENGTH);
-
-        // hash_equals provides constant-time comparison to prevent timing attacks
         if (!hash_equals($expected, $mac)) {
             throw new MacVerificationException('MAC verification failed: encrypted media is corrupt or tampered');
         }
+
+        $this->stream = new AesDecryptingStream(
+            Utils::streamFor($ciphertext),
+            $this->key->cipherKey,
+            $this->key->iv,
+        );
+    }
+
+    /**
+     * Reads exactly $length bytes from a stream (or fewer at EOF).
+     */
+    private function readExact(StreamInterface $stream, int $length): string
+    {
+        $data = '';
+        while (\strlen($data) < $length && !$stream->eof()) {
+            $data .= $stream->read($length - \strlen($data));
+        }
+        return $data;
     }
 }
